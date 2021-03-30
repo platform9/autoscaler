@@ -184,7 +184,7 @@ func BuildClusterAPI(opts config.AutoscalingOptions, do cloudprovider.NodeGroupD
 	// currently organised to do so.
 	stopCh := make(chan struct{})
 
-	controller, err := newMachineController(managementClient, workloadClient, managementDiscoveryClient, managementScaleClient, do, stopCh)
+	controller, err := newMachineController(managementClient, workloadClient, managementDiscoveryClient, managementScaleClient, do, stopCh, opts.ClusterAPIMachinePoolMachines)
 	if err != nil {
 		klog.Fatal(err)
 	}

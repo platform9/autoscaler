@@ -56,6 +56,7 @@ type testConfig struct {
 	machineDeployment *unstructured.Unstructured
 	machineSet        *unstructured.Unstructured
 	machineTemplate   *unstructured.Unstructured
+	machinePool       *unstructured.Unstructured
 	machines          []*unstructured.Unstructured
 	nodes             []*corev1.Node
 }
@@ -65,6 +66,7 @@ type testSpec struct {
 	capacity                map[string]string
 	machineDeploymentName   string
 	machineSetName          string
+	machinePoolName         string
 	clusterName             string
 	namespace               string
 	nodeCount               int
@@ -109,6 +111,7 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machinedeployments"}:              "kindList",
 			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machines"}:                        "kindList",
 			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machinesets"}:                     "kindList",
+			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinepools"}:                     "kindList",
 			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinedeployments"}:               "kindList",
 			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machines"}:                         "kindList",
 			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinesets"}:                      "kindList",
@@ -139,6 +142,9 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 						{
 							Name: resourceNameMachine,
 						},
+						{
+							Name: resourceNameMachinePool,
+						},
 					},
 				},
 				{
@@ -152,6 +158,9 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 						},
 						{
 							Name: resourceNameMachine,
+						},
+						{
+							Name: resourceNameMachinePool,
 						},
 					},
 				},
@@ -250,7 +259,7 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 	scaleClient.AddReactor("*", "*", scaleReactor)
 
 	stopCh := make(chan struct{})
-	controller, err := newMachineController(dynamicClientset, kubeclientSet, discoveryClient, scaleClient, cloudprovider.NodeGroupDiscoveryOptions{}, stopCh)
+	controller, err := newMachineController(dynamicClientset, kubeclientSet, discoveryClient, scaleClient, cloudprovider.NodeGroupDiscoveryOptions{}, stopCh, false)
 	if err != nil {
 		t.Fatal("failed to create test controller")
 	}
@@ -489,6 +498,12 @@ func addTestConfigs(t *testing.T, controller *machineController, testConfigs ...
 		}
 		if err := createResource(controller.managementClient, controller.machineSetInformer, controller.machineSetResource, config.machineSet); err != nil {
 			return err
+		}
+
+		if config.machinePool != nil {
+			if err := createResource(controller.managementClient, controller.machinePoolInformer, controller.machinePoolResource, config.machinePool); err != nil {
+				return err
+			}
 		}
 
 		for i := range config.machines {

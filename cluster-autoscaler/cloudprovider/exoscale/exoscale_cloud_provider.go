@@ -24,7 +24,9 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	egoscale "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/exoscale/internal/github.com/exoscale/egoscale/v2"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 )
 
 var _ cloudprovider.CloudProvider = (*exoscaleCloudProvider)(nil)
@@ -97,10 +99,38 @@ func (e *exoscaleCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovide
 			)
 		}
 
+		// nodeGroupSpec contains the configuration spec from the '--nodes' flag
+		// which includes the min and max size of the node group.
+		var nodeGroupSpec *dynamic.NodeGroupSpec
+		for _, spec := range e.manager.discoveryOpts.NodeGroupSpecs {
+			s, err := dynamic.SpecFromString(spec, scaleToZeroSupported)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse node group spec: %v", err)
+			}
+
+			if s.Name == *sksNodepool.Name {
+				nodeGroupSpec = s
+				break
+			}
+		}
+		var minSize, maxSize int
+		if nodeGroupSpec != nil {
+			minSize = nodeGroupSpec.MinSize
+			maxSize = nodeGroupSpec.MaxSize
+		} else {
+			minSize = 1
+			maxSize, err = e.manager.computeInstanceQuota()
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		nodeGroup = &sksNodepoolNodeGroup{
 			sksNodepool: sksNodepool,
 			sksCluster:  sksCluster,
 			m:           e.manager,
+			minSize:     minSize,
+			maxSize:     maxSize,
 		}
 		debugf("found node %s belonging to SKS Nodepool %s", toNodeID(node.Spec.ProviderID), *sksNodepool.ID)
 	} else {
@@ -176,6 +206,12 @@ func (e *exoscaleCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 	return nil
 }
 
+// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+// any GPUs, it returns nil.
+func (e *exoscaleCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(e, node)
+}
+
 // Cleanup cleans up open resources before the cloud provider is destroyed, i.e. go routines etc.
 func (e *exoscaleCloudProvider) Cleanup() error {
 	return nil
@@ -189,15 +225,15 @@ func (e *exoscaleCloudProvider) Refresh() error {
 }
 
 // BuildExoscale builds the Exoscale cloud provider.
-func BuildExoscale(_ config.AutoscalingOptions, _ cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
-	manager, err := newManager()
+func BuildExoscale(_ config.AutoscalingOptions, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+	manager, err := newManager(discoveryOpts)
 	if err != nil {
 		fatalf("failed to initialize manager: %v", err)
 	}
 
 	// The cloud provider automatically uses all Instance Pools in the k8s cluster.
-	// This means we don't use the cloudprovider.NodeGroupDiscoveryOptions
-	// flags (which can be set via '--node-group-auto-discovery' or '-nodes')
+	// The flag '--nodes=1:5:nodepoolname' may be specified to limit the size of a nodepool.
+	// The flag '--node-group-auto-discovery' is not implemented.
 	provider, err := newExoscaleCloudProvider(manager, rl)
 	if err != nil {
 		fatalf("failed to create Exoscale cloud provider: %v", err)

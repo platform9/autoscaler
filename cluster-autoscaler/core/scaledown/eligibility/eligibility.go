@@ -26,10 +26,10 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/unremovable"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/utilization"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/klogx"
 
 	apiv1 "k8s.io/api/core/v1"
+	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	klog "k8s.io/klog/v2"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
@@ -41,20 +41,22 @@ const (
 
 // Checker is responsible for deciding which nodes pass the criteria for scale down.
 type Checker struct {
-	thresholdGetter utilizationThresholdGetter
+	configGetter nodeGroupConfigGetter
 }
 
-type utilizationThresholdGetter interface {
+type nodeGroupConfigGetter interface {
 	// GetScaleDownUtilizationThreshold returns ScaleDownUtilizationThreshold value that should be used for a given NodeGroup.
-	GetScaleDownUtilizationThreshold(context *context.AutoscalingContext, nodeGroup cloudprovider.NodeGroup) (float64, error)
+	GetScaleDownUtilizationThreshold(nodeGroup cloudprovider.NodeGroup) (float64, error)
 	// GetScaleDownGpuUtilizationThreshold returns ScaleDownGpuUtilizationThreshold value that should be used for a given NodeGroup.
-	GetScaleDownGpuUtilizationThreshold(context *context.AutoscalingContext, nodeGroup cloudprovider.NodeGroup) (float64, error)
+	GetScaleDownGpuUtilizationThreshold(nodeGroup cloudprovider.NodeGroup) (float64, error)
+	// GetIgnoreDaemonSetsUtilization returns IgnoreDaemonSetsUtilization value that should be used for a given NodeGroup.
+	GetIgnoreDaemonSetsUtilization(nodeGroup cloudprovider.NodeGroup) (bool, error)
 }
 
 // NewChecker creates a new Checker object.
-func NewChecker(thresholdGetter utilizationThresholdGetter) *Checker {
+func NewChecker(configGetter nodeGroupConfigGetter) *Checker {
 	return &Checker{
-		thresholdGetter: thresholdGetter,
+		configGetter: configGetter,
 	}
 }
 
@@ -118,14 +120,9 @@ func (c *Checker) unremovableReasonAndNodeUtilization(context *context.Autoscali
 		return simulator.ScaleDownDisabledAnnotation, nil
 	}
 
-	utilInfo, err := utilization.Calculate(nodeInfo, context.IgnoreDaemonSetsUtilization, context.IgnoreMirrorPodsUtilization, context.CloudProvider.GPULabel(), timestamp)
-	if err != nil {
-		klog.Warningf("Failed to calculate utilization for %s: %v", node.Name, err)
-	}
-
 	nodeGroup, err := context.CloudProvider.NodeGroupForNode(node)
 	if err != nil {
-		klog.Warning("Node group not found for node %v: %v", node.Name, err)
+		klog.Warningf("Node group not found for node %v: %v", node.Name, err)
 		return simulator.UnexpectedError, nil
 	}
 	if nodeGroup == nil || reflect.ValueOf(nodeGroup).IsNil() {
@@ -135,17 +132,38 @@ func (c *Checker) unremovableReasonAndNodeUtilization(context *context.Autoscali
 		return simulator.NotAutoscaled, nil
 	}
 
+	ignoreDaemonSetsUtilization, err := c.configGetter.GetIgnoreDaemonSetsUtilization(nodeGroup)
+	if err != nil {
+		klog.Warningf("Couldn't retrieve `IgnoreDaemonSetsUtilization` option for node %v: %v", node.Name, err)
+		return simulator.UnexpectedError, nil
+	}
+
+	gpuConfig := context.CloudProvider.GetNodeGpuConfig(node)
+	utilInfo, err := utilization.Calculate(nodeInfo, ignoreDaemonSetsUtilization, context.IgnoreMirrorPodsUtilization, gpuConfig, timestamp)
+	if err != nil {
+		klog.Warningf("Failed to calculate utilization for %s: %v", node.Name, err)
+	}
+
+	// If scale down of unready nodes is disabled, skip the node if it is unready
+	if !context.ScaleDownUnreadyEnabled {
+		ready, _, _ := kube_util.GetReadinessState(node)
+		if !ready {
+			klog.V(4).Infof("Skipping unready node %s from delete consideration - scale-down of unready nodes is disabled", node.Name)
+			return simulator.ScaleDownUnreadyDisabled, nil
+		}
+	}
+
 	underutilized, err := c.isNodeBelowUtilizationThreshold(context, node, nodeGroup, utilInfo)
 	if err != nil {
 		klog.Warningf("Failed to check utilization thresholds for %s: %v", node.Name, err)
 		return simulator.UnexpectedError, nil
 	}
 	if !underutilized {
-		klog.V(4).Infof("Node %s is not suitable for removal - %s utilization too big (%f)", node.Name, utilInfo.ResourceName, utilInfo.Utilization)
+		klog.V(4).Infof("Node %s unremovable: %s requested (%.6g%% of allocatable) is above the scale-down utilization threshold", node.Name, utilInfo.ResourceName, utilInfo.Utilization*100)
 		return simulator.NotUnderutilized, &utilInfo
 	}
 
-	klogx.V(4).UpTo(utilLogsQuota).Infof("Node %s - %s utilization %f", node.Name, utilInfo.ResourceName, utilInfo.Utilization)
+	klogx.V(4).UpTo(utilLogsQuota).Infof("Node %s - %s requested is %.6g%% of allocatable", node.Name, utilInfo.ResourceName, utilInfo.Utilization*100)
 
 	return simulator.NoReason, &utilInfo
 }
@@ -154,13 +172,14 @@ func (c *Checker) unremovableReasonAndNodeUtilization(context *context.Autoscali
 func (c *Checker) isNodeBelowUtilizationThreshold(context *context.AutoscalingContext, node *apiv1.Node, nodeGroup cloudprovider.NodeGroup, utilInfo utilization.Info) (bool, error) {
 	var threshold float64
 	var err error
-	if gpu.NodeHasGpu(context.CloudProvider.GPULabel(), node) {
-		threshold, err = c.thresholdGetter.GetScaleDownGpuUtilizationThreshold(context, nodeGroup)
+	gpuConfig := context.CloudProvider.GetNodeGpuConfig(node)
+	if gpuConfig != nil {
+		threshold, err = c.configGetter.GetScaleDownGpuUtilizationThreshold(nodeGroup)
 		if err != nil {
 			return false, err
 		}
 	} else {
-		threshold, err = c.thresholdGetter.GetScaleDownUtilizationThreshold(context, nodeGroup)
+		threshold, err = c.configGetter.GetScaleDownUtilizationThreshold(nodeGroup)
 		if err != nil {
 			return false, err
 		}

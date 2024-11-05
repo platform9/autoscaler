@@ -19,16 +19,18 @@ package kamatera
 import (
 	"fmt"
 	"io"
+	"os"
+
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"os"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	klog "k8s.io/klog/v2"
 )
 
@@ -110,6 +112,12 @@ func (k *kamateraCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 	return nil
 }
 
+// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+// any GPUs, it returns nil.
+func (k *kamateraCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(k, node)
+}
+
 // Cleanup cleans up open resources before the cloud provider is destroyed, i.e. go routines etc.
 func (k *kamateraCloudProvider) Cleanup() error {
 	return nil
@@ -169,8 +177,8 @@ func newKamateraCloudProvider(config io.Reader, rl *cloudprovider.ResourceLimite
 }
 
 func getKubeConfig(opts config.AutoscalingOptions) *rest.Config {
-	klog.V(1).Infof("Using kubeconfig file: %s", opts.KubeConfigPath)
-	kubeConfig, err := clientcmd.BuildConfigFromFlags("", opts.KubeConfigPath)
+	klog.V(1).Infof("Using kubeconfig file: %s", opts.KubeClientOpts.KubeConfigPath)
+	kubeConfig, err := clientcmd.BuildConfigFromFlags("", opts.KubeClientOpts.KubeConfigPath)
 	if err != nil {
 		klog.Fatalf("Failed to build kubeConfig: %v", err)
 	}

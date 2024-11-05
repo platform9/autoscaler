@@ -20,6 +20,7 @@ cluster.
   * [Scale from zero support](#scale-from-zero-support)
     * [RBAC changes for scaling from zero](#rbac-changes-for-scaling-from-zero)
     * [Pre-defined labels and taints on nodes scaled from zero](#pre-defined-labels-and-taints-on-nodes-scaled-from-zero)
+    * [CPU Architecture awareness for single-arch clusters](#cpu-architecture-awareness-for-single-arch-clusters)
 * [Specifying a Custom Resource Group](#specifying-a-custom-resource-group)
 * [Specifying a Custom Resource Version](#specifying-a-custom-resource-version)
 * [Sample manifest](#sample-manifest)
@@ -49,9 +50,7 @@ most likely need other command line flags. For more information you can invoke
 
 ## Configuring node group auto discovery
 
-If you do not configure node group auto discovery, cluster autoscaler will attempt
-to match nodes against any scalable resources found in any namespace and belonging
-to any Cluster.
+You must configure node group auto discovery to inform cluster autoscaler which cluster in which to find for scalable node groups.
 
 Limiting cluster autoscaler to only match against resources in the blue namespace
 
@@ -169,8 +168,7 @@ cluster-autoscaler --cloud-provider=clusterapi \
 
 To enable the automatic scaling of components in your cluster-api managed
 cloud there are a few annotations you need to provide. These annotations
-must be applied to either [MachineSet](https://cluster-api.sigs.k8s.io/developer/architecture/controllers/machine-set.html)
-or [MachineDeployment](https://cluster-api.sigs.k8s.io/developer/architecture/controllers/machine-deployment.html)
+must be applied to either [MachineSet](https://cluster-api.sigs.k8s.io/developer/architecture/controllers/machine-set.html), [MachineDeployment](https://cluster-api.sigs.k8s.io/developer/architecture/controllers/machine-deployment.html), or [MachinePool](https://cluster-api.sigs.k8s.io/developer/architecture/controllers/machine-pool.html)
 resources depending on the type of cluster-api mechanism that you are using.
 
 There are two annotations that control how a cluster resource should be scaled:
@@ -185,8 +183,12 @@ There are two annotations that control how a cluster resource should be scaled:
   the maximum number of nodes for the associated resource group. The autoscaler
   will not scale the group above this number.
 
-The autoscaler will monitor any `MachineSet` or `MachineDeployment` containing
+The autoscaler will monitor any `MachineSet`, `MachineDeployment`, or `MachinePool` containing
 both of these annotations.
+
+> Note: `MachinePool` support in cluster-autoscaler requires a provider implementation
+> that supports the new "MachinePool Machines" feature. MachinePools in Cluster API are
+> considered an [experimental feature](https://cluster-api.sigs.k8s.io/tasks/experimental-features/experimental-features.html#active-experimental-features) and are not enabled by default.
 
 ### Scale from zero support
 
@@ -207,9 +209,9 @@ you must specify the CPU and memory annotations, these annotations should
 match the expected capacity of the nodes created from the infrastructure.
 
 For example, if my MachineDeployment will create nodes that have "16000m" CPU,
-"128G" memory, 2 NVidia GPUs, and can support 200 max pods, the folllowing
-annotations will instruct the autoscaler how to expand the node group from
-zero replicas:
+"128G" memory, "100Gi" ephemeral disk storage, 2 NVidia GPUs, and can support
+200 max pods, the following annotations will instruct the autoscaler how to
+expand the node group from zero replicas:
 
 ```yaml
 apiVersion: cluster.x-k8s.io/v1alpha4
@@ -220,6 +222,7 @@ metadata:
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "0"
     capacity.cluster-autoscaler.kubernetes.io/memory: "128G"
     capacity.cluster-autoscaler.kubernetes.io/cpu: "16"
+    capacity.cluster-autoscaler.kubernetes.io/ephemeral-disk: "100Gi"
     capacity.cluster-autoscaler.kubernetes.io/gpu-type: "nvidia.com/gpu"
     capacity.cluster-autoscaler.kubernetes.io/gpu-count: "2"
     capacity.cluster-autoscaler.kubernetes.io/maxPods: "200"
@@ -235,8 +238,8 @@ If you are using the opt-in support for scaling from zero as defined by the
 Cluster API infrastructure provider, you will need to add the infrastructure
 machine template types to your role permissions for the service account
 associated with the cluster autoscaler deployment. The service account will
-need permission to `get` and `list` the infrastructure machine templates for
-your infrastructure provider.
+need permission to `get`, `list`, and `watch` the infrastructure machine
+templates for your infrastructure provider.
 
 For example, when using the [Kubemark provider](https://github.com/kubernetes-sigs/cluster-api-provider-kubemark)
 you will need to set the following permissions:
@@ -250,14 +253,58 @@ rules:
     verbs:
     - get
     - list
+    - watch
 ```
 
 #### Pre-defined labels and taints on nodes scaled from zero
 
-The Cluster API provider currently does not support the addition of pre-defined
-labels and taints for node groups that are scaling from zero. This work is on-going
-and will be included in a future release once the API for specifying those
-labels and taints has been accepted by the community.
+To provide labels or taint information for scale from zero, the optional
+capacity annotations may be supplied as a comma separated list, as
+demonstrated in the example below:
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1alpha4
+kind: MachineDeployment
+metadata:
+  annotations:
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "0"
+    capacity.cluster-autoscaler.kubernetes.io/memory: "128G"
+    capacity.cluster-autoscaler.kubernetes.io/cpu: "16"
+    capacity.cluster-autoscaler.kubernetes.io/labels: "key1=value1,key2=value2"
+    capacity.cluster-autoscaler.kubernetes.io/taints: "key1=value1:NoSchedule,key2=value2:NoExecute"
+```
+
+#### Per-NodeGroup autoscaling options
+
+Custom autoscaling options per node group (MachineDeployment/MachinePool/MachineSet) can be specified as annoations with a common prefix:
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  annotations:
+    # overrides --scale-down-utilization-threshold global value for that specific MachineDeployment
+    cluster.x-k8s.io/autoscaling-options-scaledownutilizationthreshold: "0.5"
+    # overrides --scale-down-gpu-utilization-threshold global value for that specific MachineDeployment
+    cluster.x-k8s.io/autoscaling-options-scaledowngpuutilizationthreshold: "0.5"
+    # overrides --scale-down-unneeded-time global value for that specific MachineDeployment
+    cluster.x-k8s.io/autoscaling-options-scaledownunneededtime: "10m0s"
+    # overrides --scale-down-unready-time global value for that specific MachineDeployment
+    cluster.x-k8s.io/autoscaling-options-scaledownunreadytime: "20m0s"
+    # overrides --max-node-provision-time global value for that specific MachineDeployment
+    cluster.x-k8s.io/autoscaling-options-maxnodeprovisiontime: "20m0s"
+```
+
+#### CPU Architecture awareness for single-arch clusters 
+
+Users of single-arch non-amd64 clusters who are using scale from zero 
+support should also set the `CAPI_SCALE_ZERO_DEFAULT_ARCH` environment variable
+to set the architecture of the nodes they want to default the node group templates to.
+The autoscaler will default to `amd64` if it is not set, and the node 
+group templates may not match the nodes' architecture, specifically when 
+the workload triggering the scale-up uses a node affinity predicate checking 
+for the node's architecture.
 
 ## Specifying a Custom Resource Group
 
@@ -295,13 +342,14 @@ set, the autoscaler will use the behavior described above.
 
 ## Sample manifest
 
-A sample manifest that will create a deployment running the autoscaler is
+A [sample manifest](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/clusterapi/examples/deployment.yaml)
+that will create a deployment running the autoscaler is
 available. It can be deployed by passing it through `envsubst`, providing
 these environment variables to set the namespace to deploy into as well as the image and tag to use:
 
 ```
 export AUTOSCALER_NS=kube-system
-export AUTOSCALER_IMAGE=us.gcr.io/k8s-artifacts-prod/autoscaling/cluster-autoscaler:v1.20.0
+export AUTOSCALER_IMAGE=registry.k8s.io/autoscaling/cluster-autoscaler:v1.29.0
 envsubst < examples/deployment.yaml | kubectl apply -f-
 ```
 
@@ -334,12 +382,12 @@ spec:
     class: "quick-start"
     version: v1.24.0
     controlPlane:
-      replicas: 1 
+      replicas: 1
     workers:
       machineDeployments:
         - class: default-worker
           name: linux
-       ## replicas field is not set. 
+       ## replicas field is not set.
        ## replicas: 1
 ```
 
@@ -426,4 +474,3 @@ here as a reference for users who might be deploying on these infrastructures.
 | IBM Cloud | `ibm-cloud.kubernetes.io/worker-id` | Used by the IBM Cloud Cloud Controller Manager to identify the node |
 | IBM Cloud | `vpc-block-csi-driver-labels` | Used by the IBM Cloud CSI driver as a target for persistent volume node affinity |
 | IBM Cloud | `ibm-cloud.kubernetes.io/vpc-instance-id` | Used when a VPC is in use on IBM Cloud |
-

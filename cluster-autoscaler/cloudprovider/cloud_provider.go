@@ -60,6 +60,8 @@ const (
 	KamateraProviderName = "kamatera"
 	// KubemarkProviderName gets the provider name of kubemark
 	KubemarkProviderName = "kubemark"
+	// KwokProviderName gets the provider name of kwok
+	KwokProviderName = "kwok"
 	// HuaweicloudProviderName gets the provider name of huaweicloud
 	HuaweicloudProviderName = "huaweicloud"
 	// IonoscloudProviderName gets the provider name of ionoscloud
@@ -72,10 +74,14 @@ const (
 	LinodeProviderName = "linode"
 	// ScalewayProviderName gets the provider name of scaleway
 	ScalewayProviderName = "scaleway"
+	// VolcengineProviderName gets the provider name of volcengine
+	VolcengineProviderName = "volcengine"
 	// VultrProviderName gets the provider name of vultr
 	VultrProviderName = "vultr"
 	// PacketProviderName gets the provider name of packet
 	PacketProviderName = "packet"
+	// EquinixMetalProviderName gets the provider name of equinixmetal
+	EquinixMetalProviderName = "equinixmetal"
 	// TencentcloudProviderName gets the provider name of tencentcloud
 	TencentcloudProviderName = "tencentcloud"
 	// ExternalGrpcProviderName gets the provider name of the external grpc provider
@@ -85,6 +91,13 @@ const (
 	// RancherProviderName gets the provider name of rancher
 	RancherProviderName = "rancher"
 )
+
+// GpuConfig contains the label, type and the resource name for a GPU.
+type GpuConfig struct {
+	Label        string
+	Type         string
+	ResourceName apiv1.ResourceName
+}
 
 // CloudProvider contains configuration info and functions for interacting with
 // cloud provider (GCE, AWS, etc).
@@ -127,6 +140,10 @@ type CloudProvider interface {
 	// GetAvailableGPUTypes return all available GPU types cloud provider supports.
 	GetAvailableGPUTypes() map[string]struct{}
 
+	// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+	// any GPUs, it returns nil.
+	GetNodeGpuConfig(*apiv1.Node) *GpuConfig
+
 	// Cleanup cleans up open resources before the cloud provider is destroyed, i.e. go routines etc.
 	Cleanup() error
 
@@ -164,6 +181,14 @@ type NodeGroup interface {
 	// to explicitly name it and use DeleteNode. This function should wait until
 	// node group size is updated. Implementation required.
 	IncreaseSize(delta int) error
+
+	// AtomicIncreaseSize tries to increase the size of the node group atomically.
+	// It returns error if requesting the entire delta fails. The method doesn't wait until the new instances appear.
+	// Implementation is optional. Implementation of this method generally requires external cloud provider support
+	// for atomically requesting multiple instances. If implemented, CA will take advantage of the method while scaling up
+	// BestEffortAtomicScaleUp ProvisioningClass, guaranteeing that all instances required for such a
+	// ProvisioningRequest are provisioned atomically.
+	AtomicIncreaseSize(delta int) error
 
 	// DeleteNodes deletes nodes from this node group. Error is returned either on
 	// failure or if the given node doesn't belong to this node group. This function
@@ -215,7 +240,7 @@ type NodeGroup interface {
 
 	// GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
 	// NodeGroup. Returning a nil will result in using default options.
-	// Implementation optional.
+	// Implementation optional. Callers MUST handle `cloudprovider.ErrNotImplemented`.
 	GetOptions(defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error)
 }
 

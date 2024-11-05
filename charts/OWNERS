@@ -2,6 +2,7 @@ approvers:
 - gjtempleton
 reviewers:
 - gjtempleton
+- jackfrancis
 
 labels:
-- helm-charts
+- area/helm-charts

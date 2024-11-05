@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
@@ -199,7 +200,7 @@ func (data *internalDeltaSnapshotData) removeNode(nodeName string) error {
 
 	if _, deleted := data.deletedNodeInfos[nodeName]; deleted {
 		// If node was deleted within this delta, fail with error.
-		return errNodeNotFound
+		return ErrNodeNotFound
 	}
 
 	_, foundInBase := data.baseData.getNodeInfo(nodeName)
@@ -210,7 +211,7 @@ func (data *internalDeltaSnapshotData) removeNode(nodeName string) error {
 
 	if !foundInBase && !foundInDelta {
 		// Node not found in the chain.
-		return errNodeNotFound
+		return ErrNodeNotFound
 	}
 
 	// Maybe consider deleting from the lists instead. Maybe not.
@@ -228,7 +229,7 @@ func (data *internalDeltaSnapshotData) nodeInfoToModify(nodeName string) (*sched
 		if !found {
 			return nil, false
 		}
-		dni = bni.Clone()
+		dni = bni.Snapshot()
 		data.modifiedNodeInfoMap[nodeName] = dni
 		data.clearCaches()
 	}
@@ -238,7 +239,7 @@ func (data *internalDeltaSnapshotData) nodeInfoToModify(nodeName string) (*sched
 func (data *internalDeltaSnapshotData) addPod(pod *apiv1.Pod, nodeName string) error {
 	ni, found := data.nodeInfoToModify(nodeName)
 	if !found {
-		return errNodeNotFound
+		return ErrNodeNotFound
 	}
 
 	ni.AddPod(pod)
@@ -254,13 +255,14 @@ func (data *internalDeltaSnapshotData) removePod(namespace, name, nodeName strin
 	// probably means things are very bad anyway.
 	ni, found := data.nodeInfoToModify(nodeName)
 	if !found {
-		return errNodeNotFound
+		return ErrNodeNotFound
 	}
 
 	podFound := false
+	logger := klog.Background()
 	for _, podInfo := range ni.Pods {
 		if podInfo.Pod.Namespace == namespace && podInfo.Pod.Name == name {
-			if err := ni.RemovePod(podInfo.Pod); err != nil {
+			if err := ni.RemovePod(logger, podInfo.Pod); err != nil {
 				return fmt.Errorf("cannot remove pod; %v", err)
 			}
 			podFound = true
@@ -378,7 +380,7 @@ func (snapshot *DeltaClusterSnapshot) getNodeInfo(nodeName string) (*schedulerfr
 	data := snapshot.data
 	node, found := data.getNodeInfo(nodeName)
 	if !found {
-		return nil, errNodeNotFound
+		return nil, ErrNodeNotFound
 	}
 	return node, nil
 }

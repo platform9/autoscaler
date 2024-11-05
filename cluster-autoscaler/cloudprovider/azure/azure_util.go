@@ -18,26 +18,24 @@ package azure
 
 import (
 	"context"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-07-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2022-08-01/compute"
 	azStorage "github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/to"
 
-	"golang.org/x/crypto/pkcs12"
-
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/version"
 	klog "k8s.io/klog/v2"
 	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
@@ -63,6 +61,12 @@ const (
 	vmResourceType  = "Microsoft.Compute/virtualMachines"
 	vmExtensionType = "Microsoft.Compute/virtualMachines/extensions"
 
+	// CSE Extension checks
+	vmssCSEExtensionName            = "vmssCSE"
+	vmssExtensionProvisioningFailed = "VMExtensionProvisioningFailed"
+	// vmExtensionProvisioningErrorClass represents a Vm extension provisioning error
+	vmExtensionProvisioningErrorClass cloudprovider.InstanceErrorClass = 103
+
 	// resource ids
 	nsgID = "nsgID"
 	rtID  = "routeTableID"
@@ -82,6 +86,16 @@ const (
 	nodeTaintTagName     = "k8s.io_cluster-autoscaler_node-template_taint_"
 	nodeResourcesTagName = "k8s.io_cluster-autoscaler_node-template_resources_"
 	nodeOptionsTagName   = "k8s.io_cluster-autoscaler_node-template_autoscaling-options_"
+
+	// PowerStates reflect the operational state of a VM
+	// From https://learn.microsoft.com/en-us/java/api/com.microsoft.azure.management.compute.powerstate?view=azure-java-stable
+	vmPowerStateStarting     = "PowerState/starting"
+	vmPowerStateRunning      = "PowerState/running"
+	vmPowerStateStopping     = "PowerState/stopping"
+	vmPowerStateStopped      = "PowerState/stopped"
+	vmPowerStateDeallocating = "PowerState/deallocating"
+	vmPowerStateDeallocated  = "PowerState/deallocated"
+	vmPowerStateUnknown      = "PowerState/unknown"
 )
 
 var (
@@ -170,7 +184,7 @@ func (util *AzUtil) DeleteVirtualMachine(rg string, name string) error {
 	}
 	klog.V(2).Infof("VirtualMachine %s/%s removed", rg, name)
 
-	if len(nicName) > 0 {
+	if nicName != "" {
 		klog.Infof("deleting nic: %s/%s", rg, nicName)
 		interfaceCtx, interfaceCancel := getContextWithCancel()
 		defer interfaceCancel()
@@ -214,27 +228,12 @@ func (util *AzUtil) DeleteVirtualMachine(rg string, name string) error {
 			klog.V(2).Infof("disk %s/%s removed", rg, *osDiskName)
 		}
 	}
-
 	return nil
 }
 
-// decodePkcs12 decodes a PKCS#12 client certificate by extracting the public certificate and
-// the private RSA key
-func decodePkcs12(pkcs []byte, password string) (*x509.Certificate, *rsa.PrivateKey, error) {
-	privateKey, certificate, err := pkcs12.Decode(pkcs, password)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decoding the PKCS#12 client certificate: %v", err)
-	}
-	rsaPrivateKey, isRsaKey := privateKey.(*rsa.PrivateKey)
-	if !isRsaKey {
-		return nil, nil, fmt.Errorf("PKCS#12 certificate must contain a RSA private key")
-	}
-
-	return certificate, rsaPrivateKey, nil
-}
-
 func getUserAgentExtension() string {
-	return fmt.Sprintf("cluster-autoscaler/v%s", version.ClusterAutoscalerVersion)
+	suffix := os.Getenv("AZURE_CLUSTER_AUTOSCALER_USER_AGENT_SUFFIX")
+	return fmt.Sprintf("cluster-autoscaler%s/v%s", suffix, version.ClusterAutoscalerVersion)
 }
 
 func configureUserAgent(client *autorest.Client) {
@@ -607,4 +606,51 @@ func isAzureRequestsThrottled(rerr *retry.Error) bool {
 	}
 
 	return rerr.HTTPStatusCode == http.StatusTooManyRequests
+}
+
+func isRunningVmPowerState(powerState string) bool {
+	return powerState == vmPowerStateRunning || powerState == vmPowerStateStarting
+}
+
+func isKnownVmPowerState(powerState string) bool {
+	knownPowerStates := map[string]bool{
+		vmPowerStateStarting:     true,
+		vmPowerStateRunning:      true,
+		vmPowerStateStopping:     true,
+		vmPowerStateStopped:      true,
+		vmPowerStateDeallocating: true,
+		vmPowerStateDeallocated:  true,
+		vmPowerStateUnknown:      true,
+	}
+	return knownPowerStates[powerState]
+}
+
+func vmPowerStateFromStatuses(statuses []compute.InstanceViewStatus) string {
+	for _, status := range statuses {
+		if status.Code == nil || !isKnownVmPowerState(*status.Code) {
+			continue
+		}
+		return *status.Code
+	}
+
+	// PowerState is not set if the VM is still creating (or has failed creation)
+	return vmPowerStateUnknown
+}
+
+// strconv.ParseInt, but for int
+func parseInt32(s string, base int) (int, error) {
+	val, err := strconv.ParseInt(s, base, 32)
+	if err != nil {
+		return 0, err
+	}
+	return int(val), nil
+}
+
+// strconv.ParseFloat, but for float32
+func parseFloat32(s string) (float32, error) {
+	val, err := strconv.ParseFloat(s, 32)
+	if err != nil {
+		return 0, err
+	}
+	return float32(val), nil
 }

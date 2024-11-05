@@ -26,6 +26,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/eligibility"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
+	"k8s.io/autoscaler/cluster-autoscaler/processors/nodes"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
@@ -49,9 +50,9 @@ type node struct {
 
 type scaleDownTimeGetter interface {
 	// GetScaleDownUnneededTime returns ScaleDownUnneededTime value that should be used for a given NodeGroup.
-	GetScaleDownUnneededTime(context *context.AutoscalingContext, nodeGroup cloudprovider.NodeGroup) (time.Duration, error)
+	GetScaleDownUnneededTime(nodeGroup cloudprovider.NodeGroup) (time.Duration, error)
 	// GetScaleDownUnreadyTime returns ScaleDownUnreadyTime value that should be used for a given NodeGroup.
-	GetScaleDownUnreadyTime(context *context.AutoscalingContext, nodeGroup cloudprovider.NodeGroup) (time.Duration, error)
+	GetScaleDownUnreadyTime(nodeGroup cloudprovider.NodeGroup) (time.Duration, error)
 }
 
 // NewNodes returns a new initialized Nodes object.
@@ -117,26 +118,30 @@ func (n *Nodes) Drop(node string) {
 // RemovableAt returns all nodes that can be removed at a given time, divided
 // into empty and non-empty node lists, as well as a list of nodes that were
 // unneeded, but are not removable, annotated by reason.
-func (n *Nodes) RemovableAt(context *context.AutoscalingContext, ts time.Time, resourcesLeft resource.Limits, resourcesWithLimits []string, as scaledown.ActuationStatus) (empty, needDrain []simulator.NodeToBeRemoved, unremovable []*simulator.UnremovableNode) {
+func (n *Nodes) RemovableAt(context *context.AutoscalingContext, scaleDownContext nodes.ScaleDownContext, ts time.Time) (empty, needDrain []simulator.NodeToBeRemoved, unremovable []simulator.UnremovableNode) {
 	nodeGroupSize := utils.GetNodeGroupSizeMap(context.CloudProvider)
-	for nodeName, v := range n.byName {
-		klog.V(2).Infof("%s was unneeded for %s", nodeName, ts.Sub(v.since).String())
+	emptyNodes, drainNodes := n.splitEmptyAndNonEmptyNodes()
 
-		if r := n.unremovableReason(context, v, ts, nodeGroupSize, resourcesLeft, resourcesWithLimits, as); r != simulator.NoReason {
-			unremovable = append(unremovable, &simulator.UnremovableNode{Node: v.ntbr.Node, Reason: r})
+	for nodeName, v := range emptyNodes {
+		klog.V(2).Infof("%s was unneeded for %s", nodeName, ts.Sub(v.since).String())
+		if r := n.unremovableReason(context, scaleDownContext, v, ts, nodeGroupSize); r != simulator.NoReason {
+			unremovable = append(unremovable, simulator.UnremovableNode{Node: v.ntbr.Node, Reason: r})
 			continue
 		}
-
-		if len(v.ntbr.PodsToReschedule) > 0 {
-			needDrain = append(needDrain, v.ntbr)
-		} else {
-			empty = append(empty, v.ntbr)
+		empty = append(empty, v.ntbr)
+	}
+	for nodeName, v := range drainNodes {
+		klog.V(2).Infof("%s was unneeded for %s", nodeName, ts.Sub(v.since).String())
+		if r := n.unremovableReason(context, scaleDownContext, v, ts, nodeGroupSize); r != simulator.NoReason {
+			unremovable = append(unremovable, simulator.UnremovableNode{Node: v.ntbr.Node, Reason: r})
+			continue
 		}
+		needDrain = append(needDrain, v.ntbr)
 	}
 	return
 }
 
-func (n *Nodes) unremovableReason(context *context.AutoscalingContext, v *node, ts time.Time, nodeGroupSize map[string]int, resourcesLeft resource.Limits, resourcesWithLimits []string, as scaledown.ActuationStatus) simulator.UnremovableReason {
+func (n *Nodes) unremovableReason(context *context.AutoscalingContext, scaleDownContext nodes.ScaleDownContext, v *node, ts time.Time, nodeGroupSize map[string]int) simulator.UnremovableReason {
 	node := v.ntbr.Node
 	// Check if node is marked with no scale down annotation.
 	if eligibility.HasNoScaleDownAnnotation(node) {
@@ -157,7 +162,7 @@ func (n *Nodes) unremovableReason(context *context.AutoscalingContext, v *node, 
 
 	if ready {
 		// Check how long a ready node was underutilized.
-		unneededTime, err := n.sdtg.GetScaleDownUnneededTime(context, nodeGroup)
+		unneededTime, err := n.sdtg.GetScaleDownUnneededTime(nodeGroup)
 		if err != nil {
 			klog.Errorf("Error trying to get ScaleDownUnneededTime for node %s (in group: %s)", node.Name, nodeGroup.Id())
 			return simulator.UnexpectedError
@@ -167,7 +172,7 @@ func (n *Nodes) unremovableReason(context *context.AutoscalingContext, v *node, 
 		}
 	} else {
 		// Unready nodes may be deleted after a different time than underutilized nodes.
-		unreadyTime, err := n.sdtg.GetScaleDownUnreadyTime(context, nodeGroup)
+		unreadyTime, err := n.sdtg.GetScaleDownUnreadyTime(nodeGroup)
 		if err != nil {
 			klog.Errorf("Error trying to get ScaleDownUnreadyTime for node %s (in group: %s)", node.Name, nodeGroup.Id())
 			return simulator.UnexpectedError
@@ -177,25 +182,17 @@ func (n *Nodes) unremovableReason(context *context.AutoscalingContext, v *node, 
 		}
 	}
 
-	size, found := nodeGroupSize[nodeGroup.Id()]
-	if !found {
-		klog.Errorf("Error while checking node group size %s: group size not found in cache", nodeGroup.Id())
-		return simulator.UnexpectedError
+	if reason := verifyMinSize(node.Name, nodeGroup, nodeGroupSize, scaleDownContext.ActuationStatus); reason != simulator.NoReason {
+		return reason
 	}
 
-	deletionsInProgress := as.DeletionsCount(nodeGroup.Id())
-	if size-deletionsInProgress <= nodeGroup.MinSize() {
-		klog.V(1).Infof("Skipping %s - node group min size reached", node.Name)
-		return simulator.NodeGroupMinSizeReached
-	}
-
-	resourceDelta, err := n.limitsFinder.DeltaForNode(context, node, nodeGroup, resourcesWithLimits)
+	resourceDelta, err := n.limitsFinder.DeltaForNode(context, node, nodeGroup, scaleDownContext.ResourcesWithLimits)
 	if err != nil {
 		klog.Errorf("Error getting node resources: %v", err)
 		return simulator.UnexpectedError
 	}
 
-	checkResult := resourcesLeft.CheckDeltaWithinLimits(resourceDelta)
+	checkResult := scaleDownContext.ResourcesLeft.TryDecrementBy(resourceDelta)
 	if checkResult.Exceeded() {
 		klog.V(4).Infof("Skipping %s - minimal limit exceeded for %v", node.Name, checkResult.ExceededResources)
 		for _, resource := range checkResult.ExceededResources {
@@ -211,5 +208,33 @@ func (n *Nodes) unremovableReason(context *context.AutoscalingContext, v *node, 
 		return simulator.MinimalResourceLimitExceeded
 	}
 
+	nodeGroupSize[nodeGroup.Id()]--
+	return simulator.NoReason
+}
+
+func (n *Nodes) splitEmptyAndNonEmptyNodes() (empty, needDrain map[string]*node) {
+	empty = make(map[string]*node)
+	needDrain = make(map[string]*node)
+	for name, v := range n.byName {
+		if len(v.ntbr.PodsToReschedule) > 0 {
+			needDrain[name] = v
+		} else {
+			empty[name] = v
+		}
+	}
+	return
+}
+
+func verifyMinSize(nodeName string, nodeGroup cloudprovider.NodeGroup, nodeGroupSize map[string]int, as scaledown.ActuationStatus) simulator.UnremovableReason {
+	size, found := nodeGroupSize[nodeGroup.Id()]
+	if !found {
+		klog.Errorf("Error while checking node group size %s: group size not found in cache", nodeGroup.Id())
+		return simulator.UnexpectedError
+	}
+	deletionsInProgress := as.DeletionsCount(nodeGroup.Id())
+	if size-deletionsInProgress <= nodeGroup.MinSize() {
+		klog.V(1).Infof("Skipping %s - node group min size reached", nodeName)
+		return simulator.NodeGroupMinSizeReached
+	}
 	return simulator.NoReason
 }

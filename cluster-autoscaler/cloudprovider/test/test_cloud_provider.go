@@ -25,6 +25,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
@@ -120,6 +121,12 @@ func (tcp *TestCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 	}
 }
 
+// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+// any GPUs, it returns nil.
+func (tcp *TestCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(tcp, node)
+}
+
 // NodeGroups returns all node groups configured for this cloud provider.
 func (tcp *TestCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 	tcp.Lock()
@@ -207,21 +214,19 @@ func (tcp *TestCloudProvider) NewNodeGroup(machineType string, labels map[string
 	}, nil
 }
 
-// NewNodeGroupWithId creates a new node group with custom ID suffix.
-func (tcp *TestCloudProvider) NewNodeGroupWithId(machineType string, labels map[string]string, systemLabels map[string]string,
-	taints []apiv1.Taint, extraResources map[string]resource.Quantity, id string) (cloudprovider.NodeGroup, error) {
+// BuildNodeGroup returns a test node group.
+func (tcp *TestCloudProvider) BuildNodeGroup(id string, min, max, size int, exists bool, autoprovisioned bool, machineType string, opts *config.NodeGroupAutoscalingOptions) *TestNodeGroup {
 	return &TestNodeGroup{
 		cloudProvider:   tcp,
-		id:              "autoprovisioned-" + machineType + "-" + id,
-		minSize:         0,
-		maxSize:         1000,
-		targetSize:      0,
-		exist:           false,
-		autoprovisioned: true,
+		id:              id,
+		minSize:         min,
+		maxSize:         max,
+		targetSize:      size,
+		exist:           exists,
+		autoprovisioned: autoprovisioned,
 		machineType:     machineType,
-		labels:          labels,
-		taints:          taints,
-	}, nil
+		opts:            opts,
+	}
 }
 
 // InsertNodeGroup adds already created node group to test cloud provider.
@@ -232,37 +237,28 @@ func (tcp *TestCloudProvider) InsertNodeGroup(nodeGroup cloudprovider.NodeGroup)
 	tcp.groups[nodeGroup.Id()] = nodeGroup
 }
 
-// BuildNodeGroup returns a test node group.
-func (tcp *TestCloudProvider) BuildNodeGroup(id string, min, max, size int, autoprovisioned bool, machineType string, opts *config.NodeGroupAutoscalingOptions) *TestNodeGroup {
-	return &TestNodeGroup{
-		cloudProvider:   tcp,
-		id:              id,
-		minSize:         min,
-		maxSize:         max,
-		targetSize:      size,
-		exist:           true,
-		autoprovisioned: autoprovisioned,
-		machineType:     machineType,
-		opts:            opts,
-	}
-}
-
 // AddNodeGroup adds node group to test cloud provider.
 func (tcp *TestCloudProvider) AddNodeGroup(id string, min int, max int, size int) {
-	nodeGroup := tcp.BuildNodeGroup(id, min, max, size, false, "", nil)
+	nodeGroup := tcp.BuildNodeGroup(id, min, max, size, true, false, "", nil)
+	tcp.InsertNodeGroup(nodeGroup)
+}
+
+// AddUpcomingNodeGroup adds upcoming node group to test cloud provider.
+func (tcp *TestCloudProvider) AddUpcomingNodeGroup(id string, min int, max int, size int) {
+	nodeGroup := tcp.BuildNodeGroup(id, min, max, size, false, false, "", nil)
 	tcp.InsertNodeGroup(nodeGroup)
 }
 
 // AddNodeGroupWithCustomOptions adds node group with custom options
 // to test cloud provider.
 func (tcp *TestCloudProvider) AddNodeGroupWithCustomOptions(id string, min int, max int, size int, opts *config.NodeGroupAutoscalingOptions) {
-	nodeGroup := tcp.BuildNodeGroup(id, min, max, size, false, "", opts)
+	nodeGroup := tcp.BuildNodeGroup(id, min, max, size, true, false, "", opts)
 	tcp.InsertNodeGroup(nodeGroup)
 }
 
 // AddAutoprovisionedNodeGroup adds node group to test cloud provider.
 func (tcp *TestCloudProvider) AddAutoprovisionedNodeGroup(id string, min int, max int, size int, machineType string) *TestNodeGroup {
-	nodeGroup := tcp.BuildNodeGroup(id, min, max, size, true, machineType, nil)
+	nodeGroup := tcp.BuildNodeGroup(id, min, max, size, true, true, machineType, nil)
 	tcp.InsertNodeGroup(nodeGroup)
 	return nodeGroup
 }
@@ -390,6 +386,15 @@ func (tng *TestNodeGroup) IncreaseSize(delta int) error {
 	return tng.cloudProvider.onScaleUp(tng.id, delta)
 }
 
+// AtomicIncreaseSize is not implemented.
+func (tng *TestNodeGroup) AtomicIncreaseSize(delta int) error {
+	tng.Lock()
+	tng.targetSize += delta
+	tng.Unlock()
+
+	return tng.cloudProvider.onScaleUp(tng.id, delta)
+}
+
 // Exist checks if the node group really exists on the cloud provider side. Allows to tell the
 // theoretical node group from the real one.
 func (tng *TestNodeGroup) Exist() bool {
@@ -436,6 +441,9 @@ func (tng *TestNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	id := tng.id
 	tng.targetSize -= len(nodes)
 	tng.Unlock()
+	if tng.opts != nil && tng.opts.ZeroOrMaxNodeScaling && tng.targetSize != 0 {
+		return fmt.Errorf("TestNodeGroup: attempted to partially scale down a node group that should be scaled down atomically")
+	}
 	for _, node := range nodes {
 		err := tng.cloudProvider.onScaleDown(id, node.Name)
 		if err != nil {
@@ -469,7 +477,12 @@ func (tng *TestNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 	instances := make([]cloudprovider.Instance, 0)
 	for node, nodegroup := range tng.cloudProvider.nodes {
 		if nodegroup == tng.id {
-			instances = append(instances, cloudprovider.Instance{Id: node})
+			instances = append(instances, cloudprovider.Instance{
+				Id: node,
+				Status: &cloudprovider.InstanceStatus{
+					State: cloudprovider.InstanceRunning,
+				},
+			})
 		}
 	}
 	return instances, nil

@@ -24,7 +24,9 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/context"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/predicatechecker"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/taints"
 	. "k8s.io/autoscaler/cluster-autoscaler/utils/test"
+	schedulermetrics "k8s.io/kubernetes/pkg/scheduler/metrics"
 
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
@@ -37,6 +39,8 @@ var (
 )
 
 func TestGetNodeInfosForGroups(t *testing.T) {
+	schedulermetrics.Register()
+
 	now := time.Now()
 	ready1 := BuildTestNode("n1", 1000, 1000)
 	SetNodeReadyState(ready1, true, now.Add(-2*time.Minute))
@@ -73,7 +77,7 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 	provider2.AddNodeGroup("ng6", 1, 10, 1) // Nodegroup without nodes.
 
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
-	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
+	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil)
 
 	predicateChecker, err := predicatechecker.NewTestPredicateChecker()
 	assert.NoError(t, err)
@@ -85,7 +89,7 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 			ListerRegistry: registry,
 		},
 	}
-	res, err := NewMixedTemplateNodeInfoProvider(&cacheTtl).Process(&ctx, []*apiv1.Node{justReady5, unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	res, err := NewMixedTemplateNodeInfoProvider(&cacheTtl, false).Process(&ctx, []*apiv1.Node{justReady5, unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 5, len(res))
 	info, found := res["ng1"]
@@ -112,7 +116,7 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 			ListerRegistry: registry,
 		},
 	}
-	res, err = NewMixedTemplateNodeInfoProvider(&cacheTtl).Process(&ctx, []*apiv1.Node{}, []*appsv1.DaemonSet{}, nil, now)
+	res, err = NewMixedTemplateNodeInfoProvider(&cacheTtl, false).Process(&ctx, []*apiv1.Node{}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 0, len(res))
 }
@@ -158,7 +162,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	provider1.AddNode("ng4", ready6)
 
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
-	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
+	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil)
 
 	predicateChecker, err := predicatechecker.NewTestPredicateChecker()
 	assert.NoError(t, err)
@@ -171,8 +175,8 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 			ListerRegistry: registry,
 		},
 	}
-	niProcessor := NewMixedTemplateNodeInfoProvider(&cacheTtl)
-	res, err := niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	niProcessor := NewMixedTemplateNodeInfoProvider(&cacheTtl, false)
+	res, err := niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	// Check results
 	assert.Equal(t, 4, len(res))
@@ -206,7 +210,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	assert.Equal(t, "ng3", lastDeletedGroup)
 
 	// Check cache with all nodes removed
-	res, err = niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	res, err = niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	// Check results
 	assert.Equal(t, 2, len(res))
@@ -228,7 +232,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	infoNg4Node6 := schedulerframework.NewNodeInfo()
 	infoNg4Node6.SetNode(ready6.DeepCopy())
 	niProcessor.nodeInfoCache = map[string]cacheItem{"ng4": {NodeInfo: infoNg4Node6, added: now}}
-	res, err = niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	res, err = niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	// Check if cache was used
 	assert.NoError(t, err)
 	assert.Equal(t, 2, len(res))
@@ -248,7 +252,7 @@ func TestGetNodeInfosCacheExpired(t *testing.T) {
 	// Cloud provider with TemplateNodeInfo not implemented.
 	provider := testprovider.NewTestAutoprovisioningCloudProvider(nil, nil, nil, nil, nil, nil)
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
-	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
+	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil)
 	predicateChecker, err := predicatechecker.NewTestPredicateChecker()
 	assert.NoError(t, err)
 
@@ -263,7 +267,7 @@ func TestGetNodeInfosCacheExpired(t *testing.T) {
 	tni := schedulerframework.NewNodeInfo()
 	tni.SetNode(tn)
 	// Cache expire time is set.
-	niProcessor1 := NewMixedTemplateNodeInfoProvider(&cacheTtl)
+	niProcessor1 := NewMixedTemplateNodeInfoProvider(&cacheTtl, false)
 	niProcessor1.nodeInfoCache = map[string]cacheItem{
 		"ng1": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
 		"ng2": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
@@ -272,18 +276,18 @@ func TestGetNodeInfosCacheExpired(t *testing.T) {
 	provider.AddNode("ng1", ready1)
 
 	assert.Equal(t, 2, len(niProcessor1.nodeInfoCache))
-	_, err = niProcessor1.Process(&ctx, []*apiv1.Node{ready1}, []*appsv1.DaemonSet{}, nil, now)
+	_, err = niProcessor1.Process(&ctx, []*apiv1.Node{ready1}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(niProcessor1.nodeInfoCache))
 
 	// Cache expire time isn't set.
-	niProcessor2 := NewMixedTemplateNodeInfoProvider(nil)
+	niProcessor2 := NewMixedTemplateNodeInfoProvider(nil, false)
 	niProcessor2.nodeInfoCache = map[string]cacheItem{
 		"ng1": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
 		"ng2": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
 	}
 	assert.Equal(t, 2, len(niProcessor2.nodeInfoCache))
-	_, err = niProcessor1.Process(&ctx, []*apiv1.Node{ready1}, []*appsv1.DaemonSet{}, nil, now)
+	_, err = niProcessor1.Process(&ctx, []*apiv1.Node{ready1}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 2, len(niProcessor2.nodeInfoCache))
 

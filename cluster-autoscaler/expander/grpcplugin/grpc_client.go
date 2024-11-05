@@ -92,9 +92,9 @@ func (g *grpcclientstrategy) BestOptions(expansionOptions []expander.Option, nod
 		return expansionOptions
 	}
 
-	if bestOptionsResponse == nil || bestOptionsResponse.Options == nil {
-		klog.V(4).Info("GRPC returned nil bestOptions, no options filtered")
-		return expansionOptions
+	if bestOptionsResponse == nil || len(bestOptionsResponse.Options) == 0 {
+		klog.V(4).Info("GRPC returned nil bestOptions")
+		return nil
 	}
 	// Transform back options slice
 	options := transformAndSanitizeOptionsFromGRPC(bestOptionsResponse.Options, nodeGroupIDOptionMap)
@@ -129,13 +129,13 @@ func transformAndSanitizeOptionsFromGRPC(bestOptionsResponseOptions []*protos.Op
 	var options []expander.Option
 	for _, option := range bestOptionsResponseOptions {
 		if option == nil {
-			klog.Errorf("GRPC server returned nil Option")
+			klog.Error("GRPC server returned nil Option")
 			continue
 		}
 		if _, ok := nodeGroupIDOptionMap[option.NodeGroupId]; ok {
 			options = append(options, nodeGroupIDOptionMap[option.NodeGroupId])
 		} else {
-			klog.Errorf("GRPC server returned invalid nodeGroup ID: ", option.NodeGroupId)
+			klog.Errorf("GRPC server returned invalid nodeGroup ID: %s", option.NodeGroupId)
 			continue
 		}
 	}

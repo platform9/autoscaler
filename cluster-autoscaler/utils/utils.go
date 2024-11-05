@@ -70,7 +70,17 @@ func PodSpecSemanticallyEqual(p1 apiv1.PodSpec, p2 apiv1.PodSpec) bool {
 func sanitizePodSpec(podSpec apiv1.PodSpec) apiv1.PodSpec {
 	dropProjectedVolumesAndMounts(&podSpec)
 	dropHostname(&podSpec)
+	dropEnv(&podSpec)
 	return podSpec
+}
+
+func dropEnv(podSpec *apiv1.PodSpec) {
+	for i := range podSpec.Containers {
+		podSpec.Containers[i].Env = nil
+	}
+	for i := range podSpec.InitContainers {
+		podSpec.InitContainers[i].Env = nil
+	}
 }
 
 func dropProjectedVolumesAndMounts(podSpec *apiv1.PodSpec) {
@@ -93,6 +103,16 @@ func dropProjectedVolumesAndMounts(podSpec *apiv1.PodSpec) {
 			}
 		}
 		podSpec.Containers[i].VolumeMounts = volumeMounts
+	}
+
+	for i := range podSpec.InitContainers {
+		var volumeMounts []apiv1.VolumeMount
+		for _, mount := range podSpec.InitContainers[i].VolumeMounts {
+			if ok := projectedVolumeNames[mount.Name]; !ok {
+				volumeMounts = append(volumeMounts, mount)
+			}
+		}
+		podSpec.InitContainers[i].VolumeMounts = volumeMounts
 	}
 }
 

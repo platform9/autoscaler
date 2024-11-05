@@ -17,15 +17,17 @@ limitations under the License.
 package model
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	apiv1 "k8s.io/api/core/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
-	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
-	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/controller_fetcher"
-	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 	"k8s.io/klog/v2"
+
+	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
+	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
 const (
@@ -279,6 +281,7 @@ func (cluster *ClusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	vpa.Recommendation = currentRecommendation
 	vpa.SetUpdateMode(apiObject.Spec.UpdatePolicy)
 	vpa.SetResourcePolicy(apiObject.Spec.ResourcePolicy)
+	vpa.SetAPIVersion(apiObject.GetObjectKind().GroupVersionKind().Version)
 	return nil
 }
 
@@ -327,7 +330,7 @@ func (cluster *ClusterState) MakeAggregateStateKey(pod *PodState, containerName 
 func (cluster *ClusterState) aggregateStateKeyForContainerID(containerID ContainerID) AggregateStateKey {
 	pod, podExists := cluster.Pods[containerID.PodID]
 	if !podExists {
-		panic(fmt.Sprintf("Pod not present in the ClusterState: %v", containerID.PodID))
+		panic(fmt.Sprintf("Pod not present in the ClusterState: %s/%s", containerID.PodID.Namespace, containerID.PodID.PodName))
 	}
 	return cluster.MakeAggregateStateKey(pod, containerID.ContainerName)
 }
@@ -358,20 +361,20 @@ func (cluster *ClusterState) findOrCreateAggregateContainerState(containerID Con
 //
 // 2) The last sample is too old to give meaningful recommendation (>8 days),
 // 3) There are no samples and the aggregate state was created >8 days ago.
-func (cluster *ClusterState) garbageCollectAggregateCollectionStates(now time.Time, controllerFetcher controllerfetcher.ControllerFetcher) {
-	klog.V(1).Info("Garbage collection of AggregateCollectionStates triggered")
+func (cluster *ClusterState) garbageCollectAggregateCollectionStates(ctx context.Context, now time.Time, controllerFetcher controllerfetcher.ControllerFetcher) {
+	klog.V(1).InfoS("Garbage collection of AggregateCollectionStates triggered")
 	keysToDelete := make([]AggregateStateKey, 0)
-	contributiveKeys := cluster.getContributiveAggregateStateKeys(controllerFetcher)
+	contributiveKeys := cluster.getContributiveAggregateStateKeys(ctx, controllerFetcher)
 	for key, aggregateContainerState := range cluster.aggregateStateMap {
 		isKeyContributive := contributiveKeys[key]
 		if !isKeyContributive && aggregateContainerState.isEmpty() {
 			keysToDelete = append(keysToDelete, key)
-			klog.V(1).Infof("Removing empty and not contributive AggregateCollectionState for %+v", key)
+			klog.V(1).InfoS("Removing empty and not contributive AggregateCollectionState", "key", key)
 			continue
 		}
 		if aggregateContainerState.isExpired(now) {
 			keysToDelete = append(keysToDelete, key)
-			klog.V(1).Infof("Removing expired AggregateCollectionState for %+v", key)
+			klog.V(1).InfoS("Removing expired AggregateCollectionState", "key", key)
 		}
 	}
 	for _, key := range keysToDelete {
@@ -383,7 +386,7 @@ func (cluster *ClusterState) garbageCollectAggregateCollectionStates(now time.Ti
 }
 
 // RateLimitedGarbageCollectAggregateCollectionStates removes obsolete AggregateCollectionStates from the ClusterState.
-// It performs clean up only if more than `gcInterval` passed since the last time it performed a clean up.
+// It performs clean up only if more than `gcInterval` passed since the last time it performed a cleanup.
 // AggregateCollectionState is obsolete in following situations:
 // 1) It has no samples and there are no more contributive pods - a pod is contributive in any of following situations:
 //
@@ -392,21 +395,21 @@ func (cluster *ClusterState) garbageCollectAggregateCollectionStates(now time.Ti
 //
 // 2) The last sample is too old to give meaningful recommendation (>8 days),
 // 3) There are no samples and the aggregate state was created >8 days ago.
-func (cluster *ClusterState) RateLimitedGarbageCollectAggregateCollectionStates(now time.Time, controllerFetcher controllerfetcher.ControllerFetcher) {
+func (cluster *ClusterState) RateLimitedGarbageCollectAggregateCollectionStates(ctx context.Context, now time.Time, controllerFetcher controllerfetcher.ControllerFetcher) {
 	if now.Sub(cluster.lastAggregateContainerStateGC) < cluster.gcInterval {
 		return
 	}
-	cluster.garbageCollectAggregateCollectionStates(now, controllerFetcher)
+	cluster.garbageCollectAggregateCollectionStates(ctx, now, controllerFetcher)
 	cluster.lastAggregateContainerStateGC = now
 }
 
-func (cluster *ClusterState) getContributiveAggregateStateKeys(controllerFetcher controllerfetcher.ControllerFetcher) map[AggregateStateKey]bool {
+func (cluster *ClusterState) getContributiveAggregateStateKeys(ctx context.Context, controllerFetcher controllerfetcher.ControllerFetcher) map[AggregateStateKey]bool {
 	contributiveKeys := map[AggregateStateKey]bool{}
 	for _, pod := range cluster.Pods {
 		// Pod is considered contributive in any of following situations:
 		// 1) It is in active state - i.e. not PodSucceeded nor PodFailed.
 		// 2) Its associated controller (e.g. Deployment) still exists.
-		podControllerExists := cluster.GetControllerForPodUnderVPA(pod, controllerFetcher) != nil
+		podControllerExists := cluster.GetControllerForPodUnderVPA(ctx, pod, controllerFetcher) != nil
 		podActive := pod.Phase != apiv1.PodSucceeded && pod.Phase != apiv1.PodFailed
 		if podActive || podControllerExists {
 			for container := range pod.Containers {
@@ -431,7 +434,7 @@ func (cluster *ClusterState) RecordRecommendation(vpa *Vpa, now time.Time) error
 	} else {
 		if lastLogged.Add(RecommendationMissingMaxDuration).Before(now) {
 			cluster.EmptyVPAs[vpa.ID] = now
-			return fmt.Errorf("VPA %v/%v is missing recommendation for more than %v", vpa.ID.Namespace, vpa.ID.VpaName, RecommendationMissingMaxDuration)
+			return fmt.Errorf("VPA %s/%s is missing recommendation for more than %v", vpa.ID.Namespace, vpa.ID.VpaName, RecommendationMissingMaxDuration)
 		}
 	}
 	return nil
@@ -451,7 +454,7 @@ func (cluster *ClusterState) GetMatchingPods(vpa *Vpa) []PodID {
 }
 
 // GetControllerForPodUnderVPA returns controller associated with given Pod. Returns nil if Pod is not controlled by a VPA object.
-func (cluster *ClusterState) GetControllerForPodUnderVPA(pod *PodState, controllerFetcher controllerfetcher.ControllerFetcher) *controllerfetcher.ControllerKeyWithAPIVersion {
+func (cluster *ClusterState) GetControllerForPodUnderVPA(ctx context.Context, pod *PodState, controllerFetcher controllerfetcher.ControllerFetcher) *controllerfetcher.ControllerKeyWithAPIVersion {
 	controllingVPA := cluster.GetControllingVPA(pod)
 	if controllingVPA != nil {
 		controller := &controllerfetcher.ControllerKeyWithAPIVersion{
@@ -462,7 +465,7 @@ func (cluster *ClusterState) GetControllerForPodUnderVPA(pod *PodState, controll
 			},
 			ApiVersion: controllingVPA.TargetRef.APIVersion,
 		}
-		topLevelController, _ := controllerFetcher.FindTopMostWellKnownOrScalable(controller)
+		topLevelController, _ := controllerFetcher.FindTopMostWellKnownOrScalable(ctx, controller)
 		return topLevelController
 	}
 	return nil
@@ -489,7 +492,7 @@ type aggregateStateKey struct {
 	labelSetMap *labelSetMap
 }
 
-// Labels returns the namespace for the aggregateStateKey.
+// Namespace returns the namespace for the aggregateStateKey.
 func (k aggregateStateKey) Namespace() string {
 	return k.namespace
 }

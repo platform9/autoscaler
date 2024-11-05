@@ -32,7 +32,7 @@ trap cleanup EXIT
 if [[ -z $(which controller-gen) ]]; then
     (
         cd $WORKSPACE
-	      go install sigs.k8s.io/controller-tools/cmd/controller-gen@0.9.2
+	      go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.9.2
     )
     CONTROLLER_GEN=${GOBIN:-$(go env GOPATH)/bin}/controller-gen
 else
@@ -40,7 +40,7 @@ else
 fi
 
 # The following commands always returns an error because controller-gen does not accept keys other than strings.
-${CONTROLLER_GEN} ${CRD_OPTS} paths="${APIS_PATH}/..." output:crd:dir=${WORKSPACE} >& ${WORKSPACE}/errors.log ||:
+${CONTROLLER_GEN} ${CRD_OPTS} paths="${APIS_PATH}/..." output:crd:dir="\"${WORKSPACE}\"" >& ${WORKSPACE}/errors.log ||:
 grep -v -e 'map keys must be strings, not int' -e 'not all generators ran successfully' -e 'usage' ${WORKSPACE}/errors.log \
     && { echo "Failed to generate CRD YAMLs."; exit 1; }
 

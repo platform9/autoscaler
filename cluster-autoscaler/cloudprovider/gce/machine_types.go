@@ -35,6 +35,8 @@ type MachineType struct {
 	CPU int64
 	// Memory is the memory capacity of the machine in bytes.
 	Memory int64
+	// MaxDisk is the maximum total persistent disks size (GB) allowed.
+	MaxDiskSizeGb int64
 }
 
 // IsCustomMachine checks if a machine type is custom or predefined.
@@ -57,7 +59,7 @@ func GetMachineFamily(machineType string) (string, error) {
 	if len(parts) < 2 {
 		return "", fmt.Errorf("unable to parse machine type %q", machineType)
 	}
-	if parts[0] == "custom" {
+	if parts[0] == "custom" || parts[0] == "f1" || parts[0] == "g1" {
 		return "n1", nil
 	}
 	return parts[0], nil
@@ -70,9 +72,10 @@ func NewMachineTypeFromAPI(name string, mt *gce_api.MachineType) (MachineType, e
 		return MachineType{}, fmt.Errorf("Failed to create MachineType %s from empty API object", name)
 	}
 	return MachineType{
-		Name:   name,
-		CPU:    mt.GuestCpus,
-		Memory: mt.MemoryMb * units.MiB,
+		Name:          name,
+		CPU:           mt.GuestCpus,
+		Memory:        mt.MemoryMb * units.MiB,
+		MaxDiskSizeGb: mt.MaximumPersistentDisksSizeGb,
 	}, nil
 }
 

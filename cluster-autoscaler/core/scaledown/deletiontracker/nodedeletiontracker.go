@@ -148,7 +148,8 @@ func (n *NodeDeletionTracker) DeletionsCount(nodeGroupId string) int {
 	return n.deletionsPerNodeGroup[nodeGroupId]
 }
 
-// DeletionResults returns deletion results in a map form, along with the timestamp of last result.
+// DeletionResults returns deletion results since the last ClearResultsNotNewerThan call
+// in a map form, along with the timestamp of last result.
 func (n *NodeDeletionTracker) DeletionResults() (map[string]status.NodeDeleteResult, time.Time) {
 	n.Lock()
 	defer n.Unlock()
@@ -167,4 +168,30 @@ func (n *NodeDeletionTracker) ClearResultsNotNewerThan(t time.Time) {
 	n.Lock()
 	defer n.Unlock()
 	n.deletionResults.DropNotNewerThan(t)
+}
+
+// Snapshot return a copy of NodeDeletionTracker.
+func (n *NodeDeletionTracker) Snapshot() *NodeDeletionTracker {
+	n.Lock()
+	defer n.Unlock()
+
+	n.evictions.DropNotNewerThan(n.clock.Now().Add(-n.evictionsTTL))
+
+	snapshot := NewNodeDeletionTracker(n.evictionsTTL)
+	for k, val := range n.emptyNodeDeletions {
+		snapshot.emptyNodeDeletions[k] = val
+	}
+	for k, val := range n.drainedNodeDeletions {
+		snapshot.drainedNodeDeletions[k] = val
+	}
+	for k, val := range n.deletionsPerNodeGroup {
+		snapshot.deletionsPerNodeGroup[k] = val
+	}
+	for _, eviction := range n.evictions.ToSlice() {
+		snapshot.evictions.RegisterElement(eviction)
+	}
+	for _, result := range n.deletionResults.ToSlice() {
+		snapshot.deletionResults.RegisterElement(result)
+	}
+	return snapshot
 }

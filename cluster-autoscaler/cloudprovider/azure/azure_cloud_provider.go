@@ -17,20 +17,24 @@ limitations under the License.
 package azure
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	klog "k8s.io/klog/v2"
 )
 
 const (
 	// GPULabel is the label added to nodes with GPU resource.
-	GPULabel = "accelerator"
+	GPULabel       = AKSLabelKeyPrefixValue + "accelerator"
+	legacyGPULabel = "accelerator"
 )
 
 var (
@@ -79,6 +83,13 @@ func (azure *AzureCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 	return availableGPUTypes
 }
 
+// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+// any GPUs, it returns nil.
+func (azure *AzureCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(azure, node)
+
+}
+
 // NodeGroups returns all node groups configured for this cloud provider.
 func (azure *AzureCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 	asgs := azure.azureManager.getNodeGroups()
@@ -97,6 +108,12 @@ func (azure *AzureCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovid
 		klog.V(6).Infof("Skipping the search for node group for the node '%s' because it has no spec.ProviderID", node.ObjectMeta.Name)
 		return nil, nil
 	}
+
+	if !strings.HasPrefix(node.Spec.ProviderID, "azure://") {
+		klog.V(6).Infof("Wrong azure ProviderID for node %v, skipped", node.Name)
+		return nil, nil
+	}
+
 	klog.V(6).Infof("Searching for node group for the node: %s\n", node.Spec.ProviderID)
 	ref := &azureRef{
 		Name: node.Spec.ProviderID,
@@ -106,9 +123,27 @@ func (azure *AzureCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovid
 	return azure.azureManager.GetNodeGroupForInstance(ref)
 }
 
-// HasInstance returns whether a given node has a corresponding instance in this cloud provider
-func (azure *AzureCloudProvider) HasInstance(*apiv1.Node) (bool, error) {
-	return true, cloudprovider.ErrNotImplemented
+// HasInstance returns whether a given node has a corresponding instance in this cloud provider.
+//
+// Used to prevent undercount of existing VMs (taint-based overcount of deleted VMs),
+// and so should not return false, nil (no instance) if uncertain; return error instead.
+// (Think "has instance for sure, else error".) Returning an error causes fallback to taint-based
+// determination; use ErrNotImplemented for silent fallback, any other error will be logged.
+//
+// Expected behavior (should work for VMSS Uniform/Flex, and VMs):
+// -  exists            : return true, nil
+// - !exists            : return *,    ErrNotImplemented (could use custom error for autoscaled nodes)
+// - unimplemented case : return *,    ErrNotImplemented
+// - any other error    : return *,    error
+func (azure *AzureCloudProvider) HasInstance(node *apiv1.Node) (bool, error) {
+	if node.Spec.ProviderID == "" {
+		return false, fmt.Errorf("ProviderID for node: %s is empty, skipped", node.Name)
+	}
+
+	if !strings.HasPrefix(node.Spec.ProviderID, "azure://") {
+		return false, fmt.Errorf("invalid azure ProviderID prefix for node: %s, skipped", node.Name)
+	}
+	return azure.azureManager.azureCache.HasInstance(node.Spec.ProviderID)
 }
 
 // Pricing returns pricing model for this cloud provider or error if not available.

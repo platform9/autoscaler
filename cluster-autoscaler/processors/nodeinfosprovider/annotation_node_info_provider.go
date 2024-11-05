@@ -29,23 +29,30 @@ import (
 
 // AnnotationNodeInfoProvider is a wrapper for MixedTemplateNodeInfoProvider.
 type AnnotationNodeInfoProvider struct {
-	mixedTemplateNodeInfoProvider *MixedTemplateNodeInfoProvider
+	templateNodeInfoProvider TemplateNodeInfoProvider
 }
 
-// NewAnnotationNodeInfoProvider returns AnnotationNodeInfoProvider.
-func NewAnnotationNodeInfoProvider(t *time.Duration) *AnnotationNodeInfoProvider {
+// NewAnnotationNodeInfoProvider returns AnnotationNodeInfoProvider wrapping MixedTemplateNodeInfoProvider.
+func NewAnnotationNodeInfoProvider(t *time.Duration, forceDaemonSets bool) *AnnotationNodeInfoProvider {
 	return &AnnotationNodeInfoProvider{
-		mixedTemplateNodeInfoProvider: NewMixedTemplateNodeInfoProvider(t),
+		templateNodeInfoProvider: NewMixedTemplateNodeInfoProvider(t, forceDaemonSets),
+	}
+}
+
+// NewCustomAnnotationNodeInfoProvider returns AnnotationNodeInfoProvider wrapping TemplateNodeInfoProvider.
+func NewCustomAnnotationNodeInfoProvider(templateNodeInfoProvider TemplateNodeInfoProvider) *AnnotationNodeInfoProvider {
+	return &AnnotationNodeInfoProvider{
+		templateNodeInfoProvider: templateNodeInfoProvider,
 	}
 }
 
 // Process returns the nodeInfos set for this cluster.
-func (p *AnnotationNodeInfoProvider) Process(ctx *context.AutoscalingContext, nodes []*apiv1.Node, daemonsets []*appsv1.DaemonSet, ignoredTaints taints.TaintKeySet, currentTime time.Time) (map[string]*schedulerframework.NodeInfo, errors.AutoscalerError) {
-	nodeInfos, err := p.mixedTemplateNodeInfoProvider.Process(ctx, nodes, daemonsets, ignoredTaints, currentTime)
+func (p *AnnotationNodeInfoProvider) Process(ctx *context.AutoscalingContext, nodes []*apiv1.Node, daemonsets []*appsv1.DaemonSet, taintConfig taints.TaintConfig, currentTime time.Time) (map[string]*schedulerframework.NodeInfo, errors.AutoscalerError) {
+	nodeInfos, err := p.templateNodeInfoProvider.Process(ctx, nodes, daemonsets, taintConfig, currentTime)
 	if err != nil {
 		return nil, err
 	}
-	// Add annotatios to the NodeInfo to use later in expander.
+	// Add annotations to the NodeInfo to use later in expander.
 	nodeGroups := ctx.CloudProvider.NodeGroups()
 	for _, ng := range nodeGroups {
 		if nodeInfo, ok := nodeInfos[ng.Id()]; ok {

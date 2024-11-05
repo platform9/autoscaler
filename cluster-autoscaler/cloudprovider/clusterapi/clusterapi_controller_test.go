@@ -56,6 +56,7 @@ type testConfig struct {
 	machineDeployment *unstructured.Unstructured
 	machineSet        *unstructured.Unstructured
 	machineTemplate   *unstructured.Unstructured
+	machinePool       *unstructured.Unstructured
 	machines          []*unstructured.Unstructured
 	nodes             []*corev1.Node
 }
@@ -65,6 +66,7 @@ type testSpec struct {
 	capacity                map[string]string
 	machineDeploymentName   string
 	machineSetName          string
+	machinePoolName         string
 	clusterName             string
 	namespace               string
 	nodeCount               int
@@ -74,7 +76,7 @@ type testSpec struct {
 const customCAPIGroup = "custom.x-k8s.io"
 const fifteenSecondDuration = time.Second * 15
 
-func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machineController, testControllerShutdownFunc) {
+func mustCreateTestController(t testing.TB, testConfigs ...*testConfig) (*machineController, testControllerShutdownFunc) {
 	t.Helper()
 
 	nodeObjects := make([]runtime.Object, 0)
@@ -106,9 +108,11 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 			{Group: "cluster.x-k8s.io", Version: "v1alpha3", Resource: "machinedeployments"}:             "kindList",
 			{Group: "cluster.x-k8s.io", Version: "v1alpha3", Resource: "machines"}:                       "kindList",
 			{Group: "cluster.x-k8s.io", Version: "v1alpha3", Resource: "machinesets"}:                    "kindList",
+			{Group: "cluster.x-k8s.io", Version: "v1alpha3", Resource: "machinepools"}:                   "kindList",
 			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machinedeployments"}:              "kindList",
 			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machines"}:                        "kindList",
 			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machinesets"}:                     "kindList",
+			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinepools"}:                     "kindList",
 			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinedeployments"}:               "kindList",
 			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machines"}:                         "kindList",
 			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinesets"}:                      "kindList",
@@ -139,6 +143,9 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 						{
 							Name: resourceNameMachine,
 						},
+						{
+							Name: resourceNameMachinePool,
+						},
 					},
 				},
 				{
@@ -153,6 +160,9 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 						{
 							Name: resourceNameMachine,
 						},
+						{
+							Name: resourceNameMachinePool,
+						},
 					},
 				},
 			},
@@ -162,8 +172,8 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 	scaleClient := &fakescale.FakeScaleClient{Fake: clientgotesting.Fake{}}
 	scaleReactor := func(action clientgotesting.Action) (bool, runtime.Object, error) {
 		resource := action.GetResource().Resource
-		if resource != resourceNameMachineSet && resource != resourceNameMachineDeployment {
-			// Do not attempt to react to resources that are not MachineSet or MachineDeployment
+		if resource != resourceNameMachineSet && resource != resourceNameMachineDeployment && resource != resourceNameMachinePool {
+			// Do not attempt to react to resources that are not MachineSet, MachineDeployment, or MachinePool
 			return false, nil, nil
 		}
 
@@ -171,9 +181,7 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 		if subresource != "scale" {
 			// Handle a bug in the client-go fakeNamespaceScaleClient, where the action namespace and subresource are
 			// switched for update actions
-			if action.GetVerb() == "update" && action.GetNamespace() == "scale" {
-				subresource = "scale"
-			} else {
+			if action.GetVerb() != "update" || action.GetNamespace() != "scale" {
 				// Do not attempt to respond to anything but scale subresource requests
 				return false, nil, nil
 			}
@@ -385,7 +393,9 @@ func createTestConfigs(specs ...testSpec) []*testConfig {
 			}
 			config.machineDeployment.SetAnnotations(spec.annotations)
 			config.machineDeployment.SetLabels(machineDeploymentLabels)
-			unstructured.SetNestedStringMap(config.machineDeployment.Object, machineDeploymentLabels, "spec", "selector", "matchLabels")
+			if err := unstructured.SetNestedStringMap(config.machineDeployment.Object, machineDeploymentLabels, "spec", "selector", "matchLabels"); err != nil {
+				panic(err)
+			}
 
 			ownerRefs := []metav1.OwnerReference{
 				{
@@ -397,7 +407,9 @@ func createTestConfigs(specs ...testSpec) []*testConfig {
 			config.machineSet.SetOwnerReferences(ownerRefs)
 		}
 		config.machineSet.SetLabels(machineSetLabels)
-		unstructured.SetNestedStringMap(config.machineSet.Object, machineSetLabels, "spec", "selector", "matchLabels")
+		if err := unstructured.SetNestedStringMap(config.machineSet.Object, machineSetLabels, "spec", "selector", "matchLabels"); err != nil {
+			panic(err)
+		}
 
 		machineOwner := metav1.OwnerReference{
 			Name: config.machineSet.GetName(),
@@ -418,7 +430,9 @@ func createTestConfigs(specs ...testSpec) []*testConfig {
 					},
 				},
 			}
-			unstructured.SetNestedStringMap(config.machineTemplate.Object, spec.capacity, "status", "capacity")
+			if err := unstructured.SetNestedStringMap(config.machineTemplate.Object, spec.capacity, "status", "capacity"); err != nil {
+				panic(err)
+			}
 		} else {
 			klog.V(4).Infof("not adding capacity")
 		}
@@ -444,7 +458,9 @@ func makeLinkedNodeAndMachine(i int, namespace, clusterName string, owner metav1
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("%s-%s-node-%d", namespace, owner.Name, i),
 			Annotations: map[string]string{
-				machineAnnotationKey: fmt.Sprintf("%s/%s-%s-machine-%d", namespace, namespace, owner.Name, i),
+				clusterNameAnnotationKey:      clusterName,
+				clusterNamespaceAnnotationKey: namespace,
+				machineAnnotationKey:          fmt.Sprintf("%s-%s-machine-%d", namespace, owner.Name, i),
 			},
 		},
 		Spec: corev1.NodeSpec{
@@ -478,7 +494,7 @@ func makeLinkedNodeAndMachine(i int, namespace, clusterName string, owner metav1
 	return node, machine
 }
 
-func addTestConfigs(t *testing.T, controller *machineController, testConfigs ...*testConfig) error {
+func addTestConfigs(t testing.TB, controller *machineController, testConfigs ...*testConfig) error {
 	t.Helper()
 
 	for _, config := range testConfigs {
@@ -489,6 +505,12 @@ func addTestConfigs(t *testing.T, controller *machineController, testConfigs ...
 		}
 		if err := createResource(controller.managementClient, controller.machineSetInformer, controller.machineSetResource, config.machineSet); err != nil {
 			return err
+		}
+
+		if config.machinePool != nil {
+			if err := createResource(controller.managementClient, controller.machinePoolInformer, controller.machinePoolResource, config.machinePool); err != nil {
+				return err
+			}
 		}
 
 		for i := range config.machines {
@@ -1023,9 +1045,8 @@ func TestControllerNodeGroupForNodeWithPositiveScalingBounds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		// We don't scale from 0 so nodes must belong to a
-		// nodegroup that has a scale size of at least 1.
-		if ng != nil {
+		// We allow scaling if minSize=maxSize
+		if ng == nil {
 			t.Fatalf("unexpected nodegroup: %v", ng)
 		}
 	}
@@ -1104,19 +1125,19 @@ func TestControllerNodeGroups(t *testing.T) {
 		nodeGroupMaxSizeAnnotationKey: "1",
 	}
 
-	// Test #5: machineset with no scaling bounds results in no nodegroups
+	// Test #5: 5 machineset with minSize=maxSize results in a five nodegroup
 	machineSetConfigs = createMachineSetTestConfigs(namespace, clusterName, RandomString(6), 5, 1, annotations, nil)
 	if err := addTestConfigs(t, controller, machineSetConfigs...); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assertNodegroupLen(t, controller, 0)
+	assertNodegroupLen(t, controller, 5)
 
-	// Test #6: machinedeployment with no scaling bounds results in no nodegroups
+	// Test #6: add 2 machinedeployment with minSize=maxSize
 	machineDeploymentConfigs = createMachineDeploymentTestConfigs(namespace, clusterName, RandomString(6), 2, 1, annotations, nil)
 	if err := addTestConfigs(t, controller, machineDeploymentConfigs...); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assertNodegroupLen(t, controller, 0)
+	assertNodegroupLen(t, controller, 7)
 
 	annotations = map[string]string{
 		nodeGroupMinSizeAnnotationKey: "-1",
@@ -1292,9 +1313,16 @@ func TestControllerMachineSetNodeNamesWithoutLinkage(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	nodeCount := 0
+	for _, node := range nodeNames {
+		if !isPendingMachineProviderID(normalizedProviderString(node.Id)) {
+			nodeCount++
+		}
+	}
+
 	// We removed all linkage - so we should get 0 nodes back.
-	if len(nodeNames) != 0 {
-		t.Fatalf("expected len=0, got len=%v", len(nodeNames))
+	if nodeCount != 0 {
+		t.Fatalf("expected len=0, got len=%v", nodeCount)
 	}
 }
 
@@ -1892,11 +1920,6 @@ func Test_machineController_nodeGroupForNode(t *testing.T) {
 	}, nil)
 	mdTestConfigs = append(mdTestConfigs, uniqueMDConfig)
 
-	allMachineDeployments := make([]*unstructured.Unstructured, 0, len(mdTestConfigs))
-	for i := range mdTestConfigs {
-		allMachineDeployments = append(allMachineDeployments, mdTestConfigs[i].machineDeployment)
-	}
-
 	uniqueMSConfig := createMachineSetTestConfig(RandomString(6), RandomString(6), RandomString(6), 1, map[string]string{
 		nodeGroupMinSizeAnnotationKey: "1",
 		nodeGroupMaxSizeAnnotationKey: "10",
@@ -1907,11 +1930,6 @@ func Test_machineController_nodeGroupForNode(t *testing.T) {
 		nodeGroupMaxSizeAnnotationKey: "10",
 	}, nil)
 	msTestConfigs = append(msTestConfigs, uniqueMSConfig)
-
-	allMachineSets := make([]*unstructured.Unstructured, 0, len(msTestConfigs))
-	for i := range msTestConfigs {
-		allMachineSets = append(allMachineSets, msTestConfigs[i].machineSet)
-	}
 
 	allTestConfigs := append(mdTestConfigs, msTestConfigs...)
 
@@ -2097,7 +2115,7 @@ func Test_machineController_nodeGroups(t *testing.T) {
 
 			// Sort results as order is not guaranteed.
 			sort.Slice(got, func(i, j int) bool {
-				return got[i].scalableResource.Name() < got[j].scalableResource.Name()
+				return got[i].(*nodegroup).scalableResource.Name() < got[j].(*nodegroup).scalableResource.Name()
 			})
 			sort.Slice(tc.expectedScalableResources, func(i, j int) bool {
 				return tc.expectedScalableResources[i].GetName() < tc.expectedScalableResources[j].GetName()
@@ -2105,7 +2123,7 @@ func Test_machineController_nodeGroups(t *testing.T) {
 
 			if err == nil {
 				for i := range got {
-					if !reflect.DeepEqual(got[i].scalableResource.unstructured, tc.expectedScalableResources[i]) {
+					if !reflect.DeepEqual(got[i].(*nodegroup).scalableResource.unstructured, tc.expectedScalableResources[i]) {
 						t.Errorf("nodeGroups() got = %v, expected to consist of nodegroups for scalable resources: %v", got, tc.expectedScalableResources)
 					}
 				}

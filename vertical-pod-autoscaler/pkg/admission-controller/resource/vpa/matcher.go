@@ -17,58 +17,82 @@ limitations under the License.
 package vpa
 
 import (
+	"context"
+
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/klog/v2"
+
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
+	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
-	"k8s.io/klog/v2"
 )
 
 // Matcher is capable of returning a single matching VPA object
 // for a pod. Will return nil if no matching object is found.
 type Matcher interface {
-	GetMatchingVPA(pod *core.Pod) *vpa_types.VerticalPodAutoscaler
+	GetMatchingVPA(ctx context.Context, pod *core.Pod) *vpa_types.VerticalPodAutoscaler
 }
 
 type matcher struct {
-	vpaLister       vpa_lister.VerticalPodAutoscalerLister
-	selectorFetcher target.VpaTargetSelectorFetcher
+	vpaLister         vpa_lister.VerticalPodAutoscalerLister
+	selectorFetcher   target.VpaTargetSelectorFetcher
+	controllerFetcher controllerfetcher.ControllerFetcher
 }
 
 // NewMatcher returns a new VPA matcher.
 func NewMatcher(vpaLister vpa_lister.VerticalPodAutoscalerLister,
-	selectorFetcher target.VpaTargetSelectorFetcher) Matcher {
+	selectorFetcher target.VpaTargetSelectorFetcher,
+	controllerFetcher controllerfetcher.ControllerFetcher) Matcher {
 	return &matcher{vpaLister: vpaLister,
-		selectorFetcher: selectorFetcher}
+		selectorFetcher:   selectorFetcher,
+		controllerFetcher: controllerFetcher}
 }
 
-func (m *matcher) GetMatchingVPA(pod *core.Pod) *vpa_types.VerticalPodAutoscaler {
-	configs, err := m.vpaLister.VerticalPodAutoscalers(pod.Namespace).List(labels.Everything())
+func (m *matcher) GetMatchingVPA(ctx context.Context, pod *core.Pod) *vpa_types.VerticalPodAutoscaler {
+	parentController, err := vpa_api_util.FindParentControllerForPod(ctx, pod, m.controllerFetcher)
 	if err != nil {
-		klog.Errorf("failed to get vpa configs: %v", err)
+		klog.ErrorS(err, "Failed to get parent controller for pod", "pod", klog.KObj(pod))
 		return nil
 	}
-	onConfigs := make([]*vpa_api_util.VpaWithSelector, 0)
+	if parentController == nil {
+		return nil
+	}
+
+	configs, err := m.vpaLister.VerticalPodAutoscalers(pod.Namespace).List(labels.Everything())
+	if err != nil {
+		klog.ErrorS(err, "Failed to get vpa configs")
+		return nil
+	}
+
+	var controllingVpa *vpa_types.VerticalPodAutoscaler
 	for _, vpaConfig := range configs {
 		if vpa_api_util.GetUpdateMode(vpaConfig) == vpa_types.UpdateModeOff {
 			continue
 		}
-		selector, err := m.selectorFetcher.Fetch(vpaConfig)
-		if err != nil {
-			klog.V(3).Infof("skipping VPA object %v because we cannot fetch selector: %s", vpaConfig.Name, err)
+		if vpaConfig.Spec.TargetRef == nil {
+			klog.V(5).InfoS("Skipping VPA object because targetRef is not defined. If this is a v1beta1 object, switch to v1", "vpa", klog.KObj(vpaConfig))
 			continue
 		}
-		onConfigs = append(onConfigs, &vpa_api_util.VpaWithSelector{
-			Vpa:      vpaConfig,
-			Selector: selector,
-		})
+		if vpaConfig.Spec.TargetRef.Kind != parentController.Kind ||
+			vpaConfig.Namespace != parentController.Namespace ||
+			vpaConfig.Spec.TargetRef.Name != parentController.Name {
+			continue // This pod is not associated to the right controller
+		}
+
+		selector, err := m.selectorFetcher.Fetch(ctx, vpaConfig)
+		if err != nil {
+			klog.V(3).InfoS("Skipping VPA object because we cannot fetch selector", "vpa", klog.KObj(vpaConfig), "error", err)
+			continue
+		}
+
+		vpaWithSelector := &vpa_api_util.VpaWithSelector{Vpa: vpaConfig, Selector: selector}
+		if vpa_api_util.PodMatchesVPA(pod, vpaWithSelector) && vpa_api_util.Stronger(vpaConfig, controllingVpa) {
+			controllingVpa = vpaConfig
+		}
 	}
-	klog.V(2).Infof("Let's choose from %d configs for pod %s/%s", len(onConfigs), pod.Namespace, pod.Name)
-	result := vpa_api_util.GetControllingVPAForPod(pod, onConfigs)
-	if result != nil {
-		return result.Vpa
-	}
-	return nil
+
+	return controllingVpa
 }

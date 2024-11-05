@@ -27,6 +27,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	klog "k8s.io/klog/v2"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
@@ -78,6 +79,12 @@ func (gce *GceCloudProvider) GPULabel() string {
 // GetAvailableGPUTypes return all available GPU types cloud provider supports
 func (gce *GceCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 	return availableGPUTypes
+}
+
+// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+// any GPUs, it returns nil.
+func (gce *GceCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(gce, node)
 }
 
 // NodeGroups returns all node groups configured for this cloud provider.
@@ -190,6 +197,7 @@ type gceMig struct {
 	gceManager GceManager
 	minSize    int
 	maxSize    int
+	domainUrl  string
 }
 
 // GceRef returns Mig's GceRef
@@ -227,6 +235,11 @@ func (mig *gceMig) IncreaseSize(delta int) error {
 		return fmt.Errorf("size increase too large - desired:%d max:%d", int(size)+delta, mig.MaxSize())
 	}
 	return mig.gceManager.CreateInstances(mig, int64(delta))
+}
+
+// AtomicIncreaseSize is not implemented.
+func (mig *gceMig) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 // DecreaseTargetSize decreases the target size of the node group. This function
@@ -300,7 +313,7 @@ func (mig *gceMig) DeleteNodes(nodes []*apiv1.Node) error {
 
 // Id returns mig url.
 func (mig *gceMig) Id() string {
-	return GenerateMigUrl(mig.gceRef)
+	return GenerateMigUrl(mig.domainUrl, mig.gceRef)
 }
 
 // Debug returns a debug string for the Mig.
@@ -310,7 +323,15 @@ func (mig *gceMig) Debug() string {
 
 // Nodes returns a list of all nodes that belong to this node group.
 func (mig *gceMig) Nodes() ([]cloudprovider.Instance, error) {
-	return mig.gceManager.GetMigNodes(mig)
+	gceInstances, err := mig.gceManager.GetMigNodes(mig)
+	if err != nil {
+		return nil, err
+	}
+	instances := make([]cloudprovider.Instance, len(gceInstances), len(gceInstances))
+	for i, inst := range gceInstances {
+		instances[i] = inst.Instance
+	}
+	return instances, nil
 }
 
 // Exist checks if the node group really exists on the cloud provider side.
@@ -362,12 +383,12 @@ func BuildGCE(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscover
 		defer config.Close()
 	}
 
-	manager, err := CreateGceManager(config, do, opts.Regional, opts.ConcurrentGceRefreshes, opts.UserAgent)
+	manager, err := CreateGceManager(config, do, opts.GCEOptions.LocalSSDDiskSizeProvider, opts.Regional, opts.GCEOptions.BulkMigInstancesListingEnabled, opts.GCEOptions.ConcurrentRefreshes, opts.UserAgent, opts.GCEOptions.DomainUrl, opts.GCEOptions.MigInstancesMinRefreshWaitTime)
 	if err != nil {
 		klog.Fatalf("Failed to create GCE Manager: %v", err)
 	}
 
-	pricingModel := NewGcePriceModel(NewGcePriceInfo(), opts.GceExpanderEphemeralStorageSupport)
+	pricingModel := NewGcePriceModel(NewGcePriceInfo(), opts.GCEOptions.LocalSSDDiskSizeProvider)
 	provider, err := BuildGceCloudProvider(manager, rl, pricingModel)
 	if err != nil {
 		klog.Fatalf("Failed to create GCE cloud provider: %v", err)

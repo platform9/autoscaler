@@ -29,6 +29,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/klog/v2"
 )
 
@@ -40,7 +41,6 @@ const (
 	providerIDPrefix           = "hcloud://"
 	nodeGroupLabel             = hcloudLabelNamespace + "/node-group"
 	hcloudLabelNamespace       = "hcloud"
-	drainingNodePoolId         = "draining-node-pool"
 	serverCreateTimeoutDefault = 5 * time.Minute
 	serverRegisterTimeout      = 10 * time.Minute
 	defaultPodAmountsLimit     = 110
@@ -156,6 +156,12 @@ func (d *HetznerCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 	return nil
 }
 
+// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+// any GPUs, it returns nil.
+func (d *HetznerCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(d, node)
+}
+
 // Cleanup cleans up open resources before the cloud provider is destroyed,
 // i.e. go routines etc.
 func (d *HetznerCloudProvider) Cleanup() error {
@@ -184,9 +190,12 @@ func BuildHetzner(_ config.AutoscalingOptions, do cloudprovider.NodeGroupDiscove
 		klog.Fatalf("Failed to create Hetzner cloud provider: %v", err)
 	}
 
+	if manager.clusterConfig.IsUsingNewFormat && len(manager.clusterConfig.NodeConfigs) == 0 {
+		klog.Fatalf("No cluster config present provider: %v", err)
+	}
+
 	validNodePoolName := regexp.MustCompile(`^[a-z0-9A-Z]+[a-z0-9A-Z\-\.\_]*[a-z0-9A-Z]+$|^[a-z0-9A-Z]{1}$`)
 	clusterUpdateLock := sync.Mutex{}
-
 	for _, nodegroupSpec := range do.NodeGroupSpecs {
 		spec, err := createNodePoolSpec(nodegroupSpec)
 		if err != nil {
@@ -197,6 +206,13 @@ func BuildHetzner(_ config.AutoscalingOptions, do cloudprovider.NodeGroupDiscove
 		servers, err := manager.allServers(spec.name)
 		if err != nil {
 			klog.Fatalf("Failed to get servers for for node pool %s error: %v", nodegroupSpec, err)
+		}
+
+		if manager.clusterConfig.IsUsingNewFormat {
+			_, ok := manager.clusterConfig.NodeConfigs[spec.name]
+			if !ok {
+				klog.Fatalf("No node config present for node group id `%s` error: %v", spec.name, err)
+			}
 		}
 
 		manager.nodeGroups[spec.name] = &hetznerNodeGroup{

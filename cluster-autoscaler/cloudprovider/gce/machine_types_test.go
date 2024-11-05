@@ -118,6 +118,7 @@ func TestNewCustomMachineType(t *testing.T) {
 				assert.NoError(t, err)
 				assert.Equal(t, tc.expectCPU, m.CPU)
 				assert.Equal(t, tc.expectMemory, m.Memory)
+				assert.Equal(t, int64(0), m.MaxDiskSizeGb) // unset
 			}
 		})
 	}
@@ -136,6 +137,14 @@ func TestGetMachineFamily(t *testing.T) {
 		"predefined short machine type": {
 			machineType: "e2-small",
 			wantFamily:  "e2",
+		},
+		"fallback f1 family to n1": {
+			machineType: "f1-micro",
+			wantFamily:  "n1",
+		},
+		"fallback g1 family to n1": {
+			machineType: "g1-small",
+			wantFamily:  "n1",
 		},
 		"custom machine type with family prefix": {
 			machineType: "n2-custom-2-2816",

@@ -33,6 +33,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/client-go/informers"
 	kubeclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -105,6 +106,12 @@ func (kubemark *KubemarkCloudProvider) GPULabel() string {
 // GetAvailableGPUTypes return all available GPU types cloud provider supports
 func (kubemark *KubemarkCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 	return availableGPUTypes
+}
+
+// GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
+// any GPUs, it returns nil.
+func (kubemark *KubemarkCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(kubemark, node)
 }
 
 // NodeGroups returns all node groups configured for this cloud provider.
@@ -245,6 +252,11 @@ func (nodeGroup *NodeGroup) IncreaseSize(delta int) error {
 		return fmt.Errorf("size increase too large, desired: %d max: %d", newSize, nodeGroup.MaxSize())
 	}
 	return nodeGroup.kubemarkController.SetNodeGroupSize(nodeGroup.Name, newSize)
+}
+
+// AtomicIncreaseSize is not implemented.
+func (nodeGroup *NodeGroup) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 // TargetSize returns the current TARGET size of the node group. It is possible that the
